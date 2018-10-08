@@ -95,7 +95,7 @@ class Song_search_by_lyric():
 
 #------------------------------------------分界线----------------------------------------------
 
-    def __init__(self, search, where="/Users/ChenHaodong/Downloads/music/scrapy/"):
+    def __init__(self, search, where):
         self.keyword = search
 
 
@@ -292,13 +292,18 @@ class Song_search_by_lyric():
                 text += '\n\n'
             song = self._bucket[self._id2mid[int(id)]]
             with open(song.get_comment_text_path(), 'w') as f:
-                f.write(text)
+               f.write(text)
             print("got comment on song %s"%(song.songname))
 
 
 def main():
-    s = Song_search_by_lyric('歌剧')
-    s.run()
+    search = input("Type in your keywords of music in desire.")
+    where = input("Where to save your result?")
+    if os.path.isdir(where):
+        s = Song_search_by_lyric(search, where)
+        s.run()
+    else:
+        print("Not valid folder path.")
 
 if __name__ == "__main__":
     main()
