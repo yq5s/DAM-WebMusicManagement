@@ -2,8 +2,18 @@
 import threading as th
 import os
 import requests
+from urllib3.exceptions import ProtocolError
+from requests.exceptions import ProxyError, ConnectionError, SSLError
+from scripts import jpg2png_batch
+# from pydub import AudioSegment
 
+Fail = 1
+Total_Success = 0
+Partial_Success = 2
 class Song_search_by_lyric():
+    global Fail
+    global Total_Success
+    global Partial_Success
     # Next Update ++
     class Album():
         def __init__(self):
@@ -15,7 +25,7 @@ class Song_search_by_lyric():
         def __init__(self, where_to_put_albums, songname = None, songid = None, songmid = None, albumname = None, albumid = None, albummid = None, lyric = None):
             # if not os.path.isdir(where_to_put_albums):
             #     raise ValueError("Not valid base folder path!")
-            self.where = where_to_put_albums
+            self.albums_folder = where_to_put_albums
 
             self.songname = songname
             self.songid = songid
@@ -47,14 +57,14 @@ class Song_search_by_lyric():
 
         # --
         def _decide_path(self):
-            self.album_path = os.path.join(self.where, self.albummid + '|' +self.albumname)
-            self.song_and_related_items_folder = os.path.join(self.album_path, self.songmid + '|' + self.songname)
+            self.album_path = os.path.join(self.albums_folder, self.albummid + '-' + self.albumname)
+            self.song_and_related_items_folder = os.path.join(self.album_path, self.songmid + '-' + self.songname)
 
         def get_song_data_path(self, type = 'm4a'):
             return os.path.join( self.song_and_related_items_folder, self.songname + '.%s'%(type))
 
         def get_album_timg_path(self, type = 'jpg'):
-            return os.path.join( self.where, self.albummid + '|' +self.albumname) + '/timg.%s' %(type)
+            return self.album_path + '/timg.%s' %(type)
 
 
         # Next Update ++++++++
@@ -73,11 +83,25 @@ class Song_search_by_lyric():
             return os.path.join( self.song_and_related_items_folder, 'lyric.txt')
 
 
+        def make_album_folder(self):
+            if not os.path.isdir(self.album_path):
+                os.mkdir(self.album_path)
+
+        def make_song_folder(self):
+            if not os.path.isdir(self.song_and_related_items_folder):
+                os.mkdir(self.song_and_related_items_folder)
+
+        def iter_file_paths(self):
+            yield self.get_song_data_path()
+            yield self.get_album_timg_path()
+            # yield self.get_comment_text_path()
+
         def iter_folders(self):
-            yield self.where
+            yield self.albums_folder
             yield self.album_path
             yield self.song_and_related_items_folder
 
+        # deprecated!
         def make_dirs(self):
             for dir in self.iter_folders():
                 if not os.path.isdir(dir):
@@ -95,9 +119,9 @@ class Song_search_by_lyric():
 
 #------------------------------------------分界线----------------------------------------------
 
-    def __init__(self, search, where="/Users/ChenHaodong/Downloads/music/scrapy/"):
+    def __init__(self, where="/Users/ChenHaodong/Downloads/music/scrapy/", search = None, total = 20):
         self.keyword = search
-
+        self.total = total
 
         self._song_download_info_url = "https://u.y.qq.com/cgi-bin/musicu.fcg" \
                                  "?callback=_got_song_download_info_callback" \
@@ -117,8 +141,8 @@ class Song_search_by_lyric():
                                 "&callback=_lyric_search_callback" \
                                 "ct=10" \
                                 "&t=7" \
-                                "&p=1" \
-                                "&n=20" \
+                                "&p={1}" \
+                                "&n={2}" \
                                 "&w={0}"
 
         self._fetch_lyric_search_result_headers = {
@@ -153,7 +177,7 @@ class Song_search_by_lyric():
 
         # song download url is given directly by html response
 
-        self._bucket = None
+        self._bucket = {}
 
         self._id2mid = {}
 
@@ -161,69 +185,174 @@ class Song_search_by_lyric():
 
         self.thrs = None
 
+        self._fail_urls = []
+
+
+
+    def run(self, search = None, total = None):
+        if self._get_lyric_search_list(search, total) is not Fail:
+            self._get_folders_ready()
+            print(1)
+            self._prepare_download_threadings()
+            print(2)
+            self._start_off_threadings(max_threadings=50)
+            print(3)
+            self._refetch()
+            print(4)
+            self._rename_files()
+            print(5)
+            self.convert_files()
+            print(6)
+            self._clear_bucket()
+        else:
+            print("Failed to run.")
+
+# User Utilities
+    def get_lyric_search_result(self, search = None, total = None):
+        if self._get_lyric_search_list(search, total) is not Fail:
+            return self._bucket
+        else:
+            print("Fail")
+            return None
+
+    def print_download_urls(self):
+        self._get_lyric_search_list()
+        for songmid in self._bucket:
+            rq = requests.get(self._song_download_info_url.format(songmid).replace('_got_song_download_info_callback','_print_download_urls'))
+            tmp = rq.text
+            exec('self.'+tmp)
+
+    def _print_download_urls(self, arg):
+        sip = arg["req_0"]["data"]["sip"][0]
+        purl = arg["req_0"]["data"]["midurlinfo"][0]["purl"]
+        songmid = arg["req_0"]["data"]["midurlinfo"][0]["songmid"]
+        song_download_url = os.path.join(sip, purl)
+        print(song_download_url)
+
+# Utilities
+    def _clear_bucket(self):
+        self._bucket = {}
+
 
     def resetKeyword(self, lyric_key):
         self.keyword = lyric_key
-
-
-    def run(self):
-        self._get_lyric_search_list()
-        self._prepare_download_threadings()
-        self._start_off_threadings()
+        return self
 
 
     def _get_and_exec(self, url, headers=None):
-        html = requests.get(url, headers=headers)
-        if html.status_code == 200:
-            # 执行回调函数
-            exec('self.'+html.content.replace('null', 'None'))
+        try:
+            html = requests.get(url, headers=headers)
+        except (ProtocolError, ConnectionError, ProxyError, SSLError, IOError) as e:
+            print(e.message)
+            print("Try refetch later.")
+            self._fail_urls += [(None, url, headers)]
         else:
-            raise IOError("Not Valid response status code %s" %(html.status_code))
+            if html.status_code == 200:
+                # 执行回调函数
+                exec('self.'+html.content.replace('null', 'None'))
+            else:
+                raise IOError("Not Valid response status code %s" %(html.status_code))
 
-    def _get_album_timg(self, albummid, albumname):
-        # ^^^^^^^^^  Check self.where exists at init
-        folderpath = os.path.join(self.where, self.keyword)
-        if not os.path.isdir(folderpath):
-            os.mkdir(folderpath)
-        path = folderpath + '/' + albummid + '|' + albumname + '.jpg'
-        if not os.path.isfile(path):
-            with open(path, "wb") as f:
-                jpg = requests.get(self._album_timg_url.format(albummid), stream=True)
-                f.write(jpg.raw.read())
-        print("got timg of album: %s"%(albumname))
 
+    @staticmethod
+    def _get_tmp_file_path(path):
+        basepath, file = os.path.split(path)
+        return os.path.join(basepath, '.'+file)
+
+    @staticmethod
+    def _get_permanent_file_path(tmp_path):
+        path, file = os.path.split(tmp_path)
+        if file[0] == '.': 
+            file = file[1:]
+        return os.path.join(path, file)
 
 # Lyric Search
-    def _get_lyric_search_list(self):
-        html = requests.get(self._lyric_search_url.format(self.keyword), headers = self._fetch_lyric_search_result_headers)
-        # run callback: _lyric_search_callback
-        print html.text
-        exec('self.'+html.text)
+    def _get_lyric_search_list(self, keyword = None, total = None):
+        if keyword is None:
+            keyword = self.keyword
+        if keyword is None:
+            print("You should set keyword before you try to search something.")
+            return Fail
+        if total is None:
+            total = self.total
+
+        print("total is %s"%total)
+        assert isinstance(total, int) and total > 0
+        assert ""+keyword == keyword
+        if total < 20:
+            numperpage = total
+        else:
+            numperpage = 20
+        curpage = 1
+        while self._bucket is None or len(self._bucket) < total:
+            html = requests.get(self._lyric_search_url.format(keyword, curpage, numperpage), headers = self._fetch_lyric_search_result_headers)
+            # run callback: _lyric_search_callback
+            # print html.text
+            # print '\n\n'
+            num = eval('self.'+html.text)
+            print("Received %s"%num)
+            # print("current total in bucket: "%self._bucket)
+            if num > 0:
+                curpage += 1
+            else:
+                print("No more! Currently got %s songs. You wished for %s" % (len(self._bucket), total))
+                return Partial_Success
+        return Total_Success
+
+    # def _old_get_lyric_search_list(self, keyword = None, total = None):
+    #     if keyword is None:
+    #         keyword = self.keyword
+    #     if keyword is None:
+    #         print("You should set keyword before you try to search something.")
+    #         return Fail
+    #     curpage = 1000 # test for empty response
+    #     numperpage = 20
+    #     html = requests.get(self._lyric_search_url.format(keyword, curpage, numperpage), headers = self._fetch_lyric_search_result_headers)
+    #     # run callback: _lyric_search_callback
+    #     print html.text
+    #     print '\n\n'
+    #     exec('self.'+html.text)
+    #     return Total_Success
 
     def _lyric_search_callback(self, arg):
-        self._bucket = {}
+        # self._bucket = {}
+        # !!! if do this line up, what was received last time will be eliminated!!!
         list = arg['data']['lyric']['list']
         self.thrs = []
         for item in list:
-            songname = item["songname"]
+            songname = item["songname"].replace('/',':')
             songmid = item["songmid"]
             songid = item["songid"]
-            albumname = item['albumname']
+            albumname = item['albumname'].replace('/',':')
             albummid =item["albummid"]
             albumid =item["albumid"]
             lyric = item["content"]
-            self._bucket[songmid] = self.Song(os.path.join(self.where, self.keyword), songname, songid, songmid, albumname, albumid, albummid, lyric).make_dirs()
+            self._bucket[songmid] = self.Song(self._get_keyword_folder(), songname, songid, songmid, albumname, albumid, albummid, lyric)
+            print("%s %s"%(len(self._bucket), songname.replace(':','/')))
             self._id2mid[songid] = songmid
-        # self._prepare_download_threadings()
+        # print(len(list))
+        return len(list)
+        #Used: self._prepare_download_threadings()
+        #Prefer: separated steps.
+
 
 # Prepare the related folder(s)
+    def _get_keyword_folder(self):
+        return os.path.join(self.where, self.keyword)
+
     def _get_folders_ready(self):
+        base = self._get_keyword_folder()
+        if not os.path.isdir(base):
+            os.mkdir(base)
         for songmid in self._bucket:
-            self._bucket[songmid].make_dirs()
+            self._bucket[songmid].make_album_folder()
+        for songmid in self._bucket:
+            self._bucket[songmid].make_song_folder()
+
 
 # Download Threadings
     def _prepare_download_threadings(self):
-        albumnames = {}
+        albummids = set()
         # 开线程对每个list中的歌曲请求下载信息, 并执行回应的回调函数以提取下载地址进行下载
         for songmid in self._bucket:
             self.thrs += [th.Thread(target=self._get_and_exec, args=[self._song_download_info_url.format(songmid)])]
@@ -231,18 +360,25 @@ class Song_search_by_lyric():
         # 开线程抓取和保存歌曲的评论信息
             song = self._bucket[songmid]
             self.thrs += [th.Thread(target=self._get_and_exec, args=[self._comment_url.format(song.songid)])]
-            albumnames[song.albummid]=song.albumname
         # 开线程直接下载保存专辑的timg文件
-        for albummid in albumnames:
-            self.thrs += [th.Thread(target=self._get_album_timg, args=(albummid, albumnames[albummid]))]
+            if song.albummid not in albummids:
+                albummids.add(song.albummid)
+                self.thrs += [th.Thread(target=self._get_album_timg, args=(self._album_timg_url.format(song.albummid),song.get_album_timg_path()))]
 
 
-    def _start_off_threadings(self):
-        for thr in self.thrs:
-            thr.start()
-        for thr in self.thrs:
-            thr.join()
-
+    def _start_off_threadings(self, max_threadings = 10):
+        start = 0
+        end = len(self.thrs)
+        cur = 0
+        step = max_threadings
+        while cur < end:
+            next = cur + step
+            for thr in self.thrs[cur:next]:
+                thr.start()
+            for thr in self.thrs[cur:next]:
+                thr.join()
+            cur = next
+        print("All threads joined!")
 
 # Download songs and related information
     def _got_song_download_info_callback(self, arg):
@@ -253,7 +389,6 @@ class Song_search_by_lyric():
         # ??-----
         # self._bucket[songmid].set_urls(song_url = song_download_url)
         # ------------------
-        m4a_html = requests.get(song_download_url, headers=self._fetch_song_headers, stream = True)
 
         # ------
         # 不行, 必须在lyricSearch的回调中获取图标, 因为歌曲下载信息里不包括albummid
@@ -267,17 +402,43 @@ class Song_search_by_lyric():
             raise e
         else:
             # Later Update +++ => singername
-            path = song.get_song_data_path()
+            path = self._get_tmp_file_path(song.get_song_data_path())
             try:
                 with open(path, 'wb') as f:
+                    m4a_html = requests.get(song_download_url, headers=self._fetch_song_headers, stream = True)
                     f.write(m4a_html.raw.read())
-            except IOError as e:
+            except (ProtocolError, ConnectionError, ProxyError, SSLError, IOError) as e:
                 print(e.message)
-                raise IOError('Folder not created already! '
-                              'Check @class Song(): def make_dirs(self):. '
-                              'Or check whether it is called in the previous process.')
+                print("Try refetch later.")
+                self._fail_urls += [(path, song_download_url, self._fetch_song_headers)]
+            except Exception as e:
+                print("###\nUnexpected Error. Please contact the writer!\n###")
+                raise e
             else:
+                self._rename_hidden_file(path)
                 print("got song file: %s"%(os.path.split(path)[1]))
+
+
+    def _get_album_timg(self, url, path):
+        # ^^^^^^^^^  Check self.where exists at init
+        folderpath = self._get_keyword_folder()
+        if not os.path.isdir(folderpath):
+            os.mkdir(folderpath)
+        path = self._get_tmp_file_path(path)
+        if not os.path.isfile(path):
+            try:
+                with open(path, "wb") as f:
+                    jpg = requests.get(url, stream=True)
+                    f.write(jpg.raw.read())
+            except (ProtocolError, ConnectionError, ProxyError, SSLError, IOError) as e:
+                print(e.message)
+                print("Try refetch later.")
+                self._fail_urls += [(path, url, None)]
+            except Exception as e:
+                print("###  Unexpected Error. Please contact the writer!  ###")
+                raise e
+            else:
+                print("got timg of album: %s"%(os.path.split(path)[1]))
 
     def _got_comments_callback(self, arg):
         id = arg['topid']
@@ -291,14 +452,69 @@ class Song_search_by_lyric():
                 text += c
                 text += '\n\n'
             song = self._bucket[self._id2mid[int(id)]]
-            with open(song.get_comment_text_path(), 'w') as f:
+            path = song.get_comment_text_path()
+            with open(path, 'w') as f:
                 f.write(text)
             print("got comment on song %s"%(song.songname))
 
+    def _refetch(self):
+        for path, url, headers in self._fail_urls:
+            try:
+                if path is not None:
+                    with open(path,'wb') as f:
+                        f.write(requests.get(url, headers = headers, stream=True).content)
+                else:
+                    self._get_and_exec(url, headers=headers)
+            except Exception as e:
+                print(e.message)
+                print("Fail again.. HOW? Abandon. %s, %s"%(path, url))
+                if os.path.isfile(path):
+                    os.remove(path)
+
+# More Handles on Downloaded files
+    def _rename_files(self):
+        for songmid in self._bucket:
+            for path in self._bucket[songmid].iter_file_paths():
+                tmpfilepath = self._get_tmp_file_path(path)
+                if os.path.isfile(tmpfilepath):
+                    if os.path.getsize(tmpfilepath) > 0:
+                        os.rename(tmpfilepath, path)
+                    else:
+                        print("Fail to get file %s"%path)
+                        os.remove(tmpfilepath)
+
+    def _rename_hidden_file(self, filepath):
+        if os.path.isfile(filepath):
+            if os.path.getsize(filepath) > 0:    
+                os.rename(filepath, self._get_permanent_file_path(filepath))
+                return True
+            else:
+                print("Hidden file %s not complete, deleted."%filepath)
+                os.remove(filepath)
+                return False
+
+    @staticmethod
+    def joinext(f,e):
+        if e[0] == '.':
+            return f+e
+        else:
+            return f+'.'+e
+
+    def convert_files(self, music_type='mp3', img_type='png'):
+        for songmid in self._bucket:
+            song = self._bucket[songmid]
+            songpath = song.get_song_data_path()
+            if os.path.isfile(songpath):
+                f,e = os.path.splitext(songpath)
+                # AudioSegment.from_file(songpath)[0:60*1000].export(self.joinext(f,music_type),format='mp3')
+                os.rename(songpath, f+'.mp3')
+        jpg2png_batch(self._get_keyword_folder())
+# need 搜索结果文件夹, 迭代所有歌对象
 
 def main():
-    s = Song_search_by_lyric('歌剧')
-    s.run()
+    s = Song_search_by_lyric(where=raw_input("Where to save? "), search='歌剧')
+    # s.run()
+    s.print_download_urls()
 
 if __name__ == "__main__":
     main()
